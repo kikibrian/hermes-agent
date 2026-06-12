@@ -11560,60 +11560,105 @@ def start_server(
 
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
-    # bound_port is also stashed so /api/pty can build the back-WS URL the
-    # PTY child uses to publish events to the dashboard sidebar.
     app.state.bound_host = host
-    app.state.bound_port = port
 
-    if open_browser:
-        import webbrowser
-
-        # On headless Linux (no DISPLAY or WAYLAND_DISPLAY) some registered
-        # browsers are TUI programs (links, lynx, www-browser) that try to
-        # take over the terminal.  That can send SIGHUP to the server process
-        # and cause an immediate exit even though uvicorn bound successfully.
-        # Skip the auto-open attempt on headless systems and let the user
-        # open the URL manually.  macOS and Windows are always considered
-        # display-capable.
-        _has_display = (
-            sys.platform != "linux"
-            or bool(os.environ.get("DISPLAY"))
-            or bool(os.environ.get("WAYLAND_DISPLAY"))
-        )
-
-        if _has_display:
-            _open_url = f"http://{host}:{port}"
-            if initial_profile:
-                from urllib.parse import quote
-                _open_url += f"/?profile={quote(initial_profile)}"
-
-            def _open():
-                try:
-                    time.sleep(1.0)
-                    webbrowser.open(_open_url)
-                except Exception:
-                    pass
-
-            threading.Thread(target=_open, daemon=True).start()
-        else:
-            _log.debug(
-                "Skipping browser-open: no DISPLAY or WAYLAND_DISPLAY detected "
-                "(headless Linux). Pass --no-open to suppress this detection."
-            )
-
-    print(f"  Hermes Web UI → http://{host}:{port}")
-    # proxy_headers defaults to False so _ws_client_is_allowed sees the real
-    # connection peer rather than X-Forwarded-For's rewritten value (which
-    # would defeat the loopback gate when behind a reverse proxy).  When the
-    # OAuth gate is active we are explicitly running behind a TLS terminator
-    # (Fly.io) and need X-Forwarded-Proto to decide cookie Secure flags, so
-    # we flip proxy_headers on for that mode.
-    uvicorn.run(
+    # ── Start uvicorn with direct Server API ─────────────────────────
+    # We use uvicorn.Server directly (not uvicorn.run) so we can split
+    # startup from the main loop.  After startup() the socket is actually
+    # bound — we read the OS-assigned port from the live socket, print
+    # HERMES_DASHBOARD_READY, open the browser, *then* serve.
+    #
+    # This eliminates the TOCTOU of the old pre-bind-then-close approach
+    # (bind port 0 → close → uvicorn rebind): the socket is held by
+    # uvicorn the entire time, so no other process can steal the port.
+    #
+    # For explicit non-zero ports, if the port is taken uvicorn catches
+    # OSError inside create_server() and exits with a clear error — no
+    # separate preflight probe needed.
+    config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
+        # proxy_headers defaults to False so _ws_client_is_allowed sees
+        # the real connection peer rather than X-Forwarded-For's rewritten
+        # value (which would defeat the loopback gate when behind a reverse
+        # proxy).  When the OAuth gate is active we are explicitly running
+        # behind a TLS terminator (Fly.io) and need X-Forwarded-Proto to
+        # decide cookie Secure flags, so we flip proxy_headers on for that
+        # mode.
         proxy_headers=bool(app.state.auth_required),
-        # Detect half-open WS connections (reverse-proxy 524, dropped tunnels)
-        # within ~20-40s so WebSocketDisconnect fires the disconnect→reap path.
-        # 20s stays under Cloudflare Tunnel's idle timeout, keeping it warm.
+        # Detect half-open WS connections (reverse-proxy 524, dropped
+        # tunnels) within ~20-40s so WebSocketDisconnect fires the
+        # disconnect→reap path.  20s stays under Cloudflare Tunnel's idle
+        # timeout, keeping it warm.
         ws_ping_interval=20.0,
         ws_ping_timeout=20.0,
     )
+    server = uvicorn.Server(config)
+
+    async def _serve():
+        # Replicate Server._serve but split startup / announce / main_loop
+        # so we can read the bound port after the socket is live.
+        if not config.loaded:
+            config.load()
+        server.lifespan = config.lifespan_class(config)
+        with server.capture_signals():
+            await server.startup()
+            if server.should_exit:
+                return
+
+            # Socket is bound.  Read the actual port from the live socket.
+            actual_port: int = port
+            if server.servers and server.servers[0].sockets:
+                actual_port = server.servers[0].sockets[0].getsockname()[1]
+            app.state.bound_port = actual_port
+
+            # Announce on stdout so the desktop (or any parent process)
+            # can discover the ephemeral port.  Unconditional for both
+            # port-0 and explicit-port modes — no parser special case.
+            print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
+            print(f"  Hermes Web UI → http://{host}:{actual_port}")
+
+            if open_browser:
+                import webbrowser
+
+                # On headless Linux (no DISPLAY or WAYLAND_DISPLAY) some
+                # registered browsers are TUI programs (links, lynx,
+                # www-browser) that try to take over the terminal.  That
+                # can send SIGHUP to the server process and cause an
+                # immediate exit even though uvicorn bound successfully.
+                # Skip the auto-open attempt on headless systems and let
+                # the user open the URL manually.  macOS and Windows are
+                # always considered display-capable.
+                _has_display = (
+                    sys.platform != "linux"
+                    or bool(os.environ.get("DISPLAY"))
+                    or bool(os.environ.get("WAYLAND_DISPLAY"))
+                )
+
+                if _has_display:
+                    _display_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
+                    _open_url = f"http://{_display_host}:{actual_port}"
+                    if initial_profile:
+                        from urllib.parse import quote
+                        _open_url += f"/?profile={quote(initial_profile)}"
+
+                    def _open():
+                        try:
+                            time.sleep(1.0)
+                            webbrowser.open(_open_url)
+                        except Exception:
+                            pass
+
+                    threading.Thread(target=_open, daemon=True).start()
+                else:
+                    _log.debug(
+                        "Skipping browser-open: no DISPLAY or WAYLAND_DISPLAY "
+                        "detected (headless Linux). Pass --no-open to suppress "
+                        "this detection."
+                    )
+
+            await server.main_loop()
+
+            if server.started:
+                await server.shutdown()
+
+    asyncio.run(_serve())
